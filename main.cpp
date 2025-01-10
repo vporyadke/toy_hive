@@ -49,7 +49,7 @@ using TResourceRawValues = std::tuple<Si64, Si64, Si64, Si64>;
 using TResourceNormalizedValues = std::tuple<double, double, double, double>;
 using TFullTabletId = Ui32;
 
-const TResourceRawValues MAXIMUM_VALUES = {1'000'000'000, 64'000'000'000ull, 1'000'000'000, 1'000'000'000};
+const TResourceRawValues MAXIMUM_VALUES = {1'000'000'000, 64'000'000'000ull, 1'000'000'000, 1'000'000};
 
 enum EResource : size_t {
     CPU,
@@ -70,6 +70,7 @@ enum ETabletType {
     Dummy,
     DataShard,
     ColumnShard,
+    Coordinator,
 };
 
 Rgba GetColor(ETabletType type) {
@@ -77,6 +78,7 @@ Rgba GetColor(ETabletType type) {
         case ETabletType::Dummy: return Rgba(255, 200, 100);
         case ETabletType::DataShard: return Rgba(0, 64, 255);
         case ETabletType::ColumnShard: return Rgba(200, 200, 200);
+        case ETabletType::Coordinator: return Rgba(200, 200, 0);
     }
 }
 
@@ -186,8 +188,18 @@ struct TTabletInfo {
     bool IsGoodForBalancer(TInstant now) {
         return (now - LastBalancerDecisionTime > GetTabletKickCooldownPeriod()) || LastBalancerDecisionTime == 0;
     }
+
+    bool HasAllowedMetric(EResourceToBalance resource) const {
+        if (Type == ETabletType::ColumnShard) {
+            return resource == EResourceToBalance::Counter;
+        }
+        return true;
+    }
     
     bool HasMetric(EResourceToBalance resource) const {
+        if (!HasAllowedMetric(resource)) {
+            return false;
+        }
         return ExtractResourceUsage(ResourceValues, resource) > 0;
     }
 
@@ -197,7 +209,7 @@ struct TTabletInfo {
 
     double GetWeight(EResourceToBalance resourceToBalance = EResourceToBalance::ComputeResources) const {
         auto result = ExtractResourceUsage(NormalizeRawValues(ResourceValues), resourceToBalance);
-        *Log() << "Tablet " << Id << " has weight " << result << " in resource " << (int)resourceToBalance << std::endl;
+        //*Log() << "Tablet " << Id << " has weight " << result << " in resource " << (int)resourceToBalance << std::endl;
         return result;
     }
 
@@ -254,6 +266,22 @@ struct TTabletInfo {
         UpdateResourceValues(NodeId, after - before);
     }
 
+    template <typename ResourcesType>
+    void FilterRawValues(ResourcesType& values) const {
+        if (std::get<EResource::Counter>(ResourceValues) == 0) {
+            std::get<EResource::Counter>(values) = 0;
+        }
+        if (std::get<EResource::CPU>(ResourceValues) == 0) {
+            std::get<EResource::CPU>(values) = 0;
+        }
+        if (std::get<EResource::Memory>(ResourceValues) == 0) {
+            std::get<EResource::Memory>(values) = 0;
+        }
+        if (std::get<EResource::Network>(ResourceValues) == 0) {
+            std::get<EResource::Network>(values) = 0;
+        }
+    }
+
     TTabletInfo(TFullTabletId id, const TResourceRawValues& metrics, ETabletType type = ETabletType::Dummy)
         : Id(id)
         , ResourceValues(metrics)
@@ -307,11 +335,17 @@ struct TNodeInfo {
         // what it would like when tablet will run on this node?
         TResourceRawValues nodeValues = RawValues;
         TResourceRawValues tabletValues = tablet.ResourceValues;
+        tablet.FilterRawValues(nodeValues);
+        tablet.FilterRawValues(tabletValues);
         auto current = tablet.IsAliveOnNode(Id) ? nodeValues : nodeValues + tabletValues;
         auto maximum = GetResourceMaximumValues();
         // basically, this is: return max(a / b);
         double usage = TTabletInfo::GetUsage(current, maximum);
         return usage;
+    }
+
+    void UpdateResourceTotalUsage(double usage) {
+        AveragedNodeTotalUsage.Push(usage);
     }
 
     void AddTablet(TTabletInfo& tablet) {
@@ -449,8 +483,14 @@ struct THive {
         auto minValuesToBalance = GetMinNodeUsageToBalance();
         maxValues = piecewise_max(maxValues, minValuesToBalance);
         minValues = piecewise_max(minValues, minValuesToBalance);
+        *Log() << "GetStats: ";
+        Out(*Log(), minValues);
+        *Log() << " vs ";
+        Out(*Log(), maxValues);
+        *Log() << std::endl;
         auto discrepancy = maxValues - minValues;
         auto& counterDiscrepancy = std::get<EResource::Counter>(discrepancy);
+        *Log() << counterDiscrepancy * GetMaxResourceCounter() << std::endl;
         if (counterDiscrepancy * GetMaxResourceCounter() <= 1.5) {
             // We should ignore counter discrepancy of one - it cannot be fixed by balancer
             // Value 1.5 is used to avoid rounding errors
@@ -586,6 +626,9 @@ struct THive {
     }
     
     bool IsTabletMoveExpedient(const TTabletInfo& tablet, const TNodeInfo& node) const {
+        if (Nodes.at(tablet.NodeId).IsOverloaded() && !node.IsOverloaded()) {
+            return true;
+        }
         std::vector<TResourceNormalizedValues> values;
         std::size_t oldNode = std::numeric_limits<std::size_t>::max();
         std::size_t newNode = std::numeric_limits<std::size_t>::max();
@@ -614,9 +657,14 @@ struct THive {
         values[oldNode] -= NormalizeRawValues(tabletResources);
         values[newNode] += NormalizeRawValues(tabletResources);
         TResourceNormalizedValues afterStDev = GetStDev(values);
+        tablet.FilterRawValues(beforeStDev);
+        tablet.FilterRawValues(afterStDev);
         double before = max(beforeStDev);
         double after = max(afterStDev);
         bool result = after < before;
+        if (!result) {
+            *Log() << "Move " << tablet.Id << " from " << tablet.NodeId << " to " << node.Id << " is not expedient" << std::endl;
+        }
         return result;
     }
 
@@ -810,9 +858,9 @@ struct HtapScenario {
             g_hive.Nodes.emplace(i, TNodeInfo(i));
         }
 
-        const auto max_cpu = std::get<EResource::CPU>(MAXIMUM_VALUES) * num_nodes * 6 / num_tablets / 5;
+        const auto max_cpu = std::get<EResource::CPU>(MAXIMUM_VALUES) * num_nodes * 4 / num_tablets;
         std::uniform_int_distribution<Ui64> get_cpu(0, max_cpu);
-        const auto max_memory = std::get<EResource::Memory>(MAXIMUM_VALUES) * num_nodes * 6 / num_tablets / 5;
+        const auto max_memory = std::get<EResource::Memory>(MAXIMUM_VALUES) * num_nodes * 12 / num_tablets / 5;
         std::uniform_int_distribution<Ui64> get_memory(0, max_memory);
         for (TFullTabletId i = 1; i <= num_tablets; ++i) {
             if (i % 2 == 0) {
@@ -844,6 +892,54 @@ struct HtapScenario {
                 std::uniform_int_distribution<Ui64> get_cpu(0, max_cpu);
                 tablet.UpdateResourceUsage({get_cpu(g_random), std::nullopt, std::nullopt});
                 g_burst_tablets.erase(tabletId);
+            }
+        }
+
+        for (auto& [nodeId, node] : g_hive.Nodes) {
+            double weight = 0;
+            for (const auto* tablet : node.Tablets) {
+                weight += tablet->GetWeight();
+            }
+            node.UpdateResourceTotalUsage(weight * 1.1);
+        }
+    }
+};
+
+struct OneFatTabletScenario {
+    void CreateInitialState() {
+        const size_t num_nodes = 8;
+        const size_t num_tablets = 42;
+        for (TNodeId i = 1; i <= num_nodes; ++i) {
+            g_hive.Nodes.emplace(i, TNodeInfo(i));
+        }
+
+        const auto max_cpu = std::get<EResource::CPU>(MAXIMUM_VALUES) * num_nodes / num_tablets;
+        std::uniform_int_distribution<Ui64> get_cpu(0, max_cpu);
+        const auto max_memory = std::get<EResource::Memory>(MAXIMUM_VALUES) * num_nodes / num_tablets;
+        std::uniform_int_distribution<Ui64> get_memory(0, max_memory);
+        for (TFullTabletId i = 1; i < num_tablets; ++i) {
+            g_hive.Tablets.emplace(i, TTabletInfo(i, {get_cpu(g_random), get_memory(g_random), 0, 0}, ETabletType::DataShard));
+        }
+        g_hive.Tablets.emplace(42, TTabletInfo(42, {get_cpu(g_random), get_memory(g_random), 0, 0}, ETabletType::Coordinator));
+
+        std::uniform_int_distribution<TNodeId> pick_node(1, num_nodes);
+        for (auto& [tabletId, tablet] : g_hive.Tablets) {
+            g_hive.FindNode(pick_node(g_random))->AddTablet(tablet);
+        }
+    }
+
+    void UpdateModel() {
+        g_t += g_dt;
+        g_hive.ProcessTabletBalancer(); 
+
+        std::uniform_real_distribution<double> coordinator_usage(0.8, 1);
+        std::uniform_real_distribution<double> normal_usage(0.3, 0.7);
+        auto coordinator_node = g_hive.Tablets.at(42).NodeId;
+        for (auto& [nodeId, node] : g_hive.Nodes) {
+            if (nodeId == coordinator_node) {
+                node.UpdateResourceTotalUsage(coordinator_usage(g_random));
+            } else {
+                node.UpdateResourceTotalUsage(normal_usage(g_random));
             }
         }
     }
@@ -913,7 +1009,7 @@ void EasyMain() {
 
 
   // Create initial simulation state
-  HtapScenario scenario; // Change the type here for different scenarios
+  OneFatTabletScenario scenario; // Change the type here for different scenarios
   scenario.CreateInitialState();
 
   // Main simulation loop
