@@ -25,8 +25,15 @@ TInstant Now() {
 }
 
 // GUI elements
+GuiFactory gf;
 std::shared_ptr<GuiTheme> g_theme;
 std::shared_ptr<Panel> g_gui;
+std::shared_ptr<Scrollbar> g_tablet_metrics_scrollbar;
+std::shared_ptr<Scrollbar> g_usage_scrollbar;
+std::shared_ptr<Checkbox> g_no_moves_checkbox;
+std::shared_ptr<Checkbox> g_guess_usage_checkbox;
+std::shared_ptr<Checkbox> g_fill_nodes_checkbox;
+Si32 g_max_tablet_metrics = 100'000'000; 
 
 
 // Global simulation state
@@ -132,7 +139,7 @@ inline std::tuple<ResourceTypes...> GetStDev(std::vector<std::tuple<ResourceType
 }
 
 TResourceNormalizedValues GetMinNodeUsageToBalance() {
-    return {0.1, 0.1, 0.1, 0};
+    return {0.3, 0.3, 0.3, 0};
 }
 
 Ui64 GetMaxResourceCounter() {
@@ -184,6 +191,7 @@ struct TTabletInfo {
     ETabletType Type;
     TNodeId NodeId;
     TInstant LastBalancerDecisionTime = 0;
+    double Weight = 0;
 
     bool IsGoodForBalancer(TInstant now) {
         return (now - LastBalancerDecisionTime > GetTabletKickCooldownPeriod()) || LastBalancerDecisionTime == 0;
@@ -210,7 +218,7 @@ struct TTabletInfo {
     double GetWeight(EResourceToBalance resourceToBalance = EResourceToBalance::ComputeResources) const {
         auto result = ExtractResourceUsage(NormalizeRawValues(ResourceValues), resourceToBalance);
         //*Log() << "Tablet " << Id << " has weight " << result << " in resource " << (int)resourceToBalance << std::endl;
-        return result;
+        return std::max(result, Weight);
     }
 
     bool IsAliveOnNode(TNodeId nodeId) const {
@@ -299,13 +307,20 @@ struct TTabletInfo {
 };
 
 struct TNodeInfo {
+    enum ENodeKind : Ui32 {
+        ModernCPU,
+        OldCPU,
+    };
     TResourceRawValues RawValues;
     NMetrics::TFastRiseAverageValue<double, 20> AveragedNodeTotalUsage;
     std::set<TTabletInfo*> Tablets;
     TNodeId Id;
+    Ui32 NodeKind = ModernCPU;
+    mutable bool Drawn = false;
+    bool Alive = true;
 
     bool IsAlive() const {
-        return true;
+        return Alive;
     }
 
     double GetNodeUsage(const TResourceNormalizedValues& normValues, EResourceToBalance resource = EResourceToBalance::ComputeResources) const {
@@ -322,7 +337,11 @@ struct TNodeInfo {
     }
 
     TResourceRawValues GetResourceMaximumValues() const {
-        return MAXIMUM_VALUES; 
+        auto maxValues = MAXIMUM_VALUES;
+        if (NodeKind == OldCPU) {
+            std::get<EResource::CPU>(maxValues) /= 2;
+        }
+        return maxValues;
     }
 
     bool IsOverloaded() const {
@@ -341,11 +360,19 @@ struct TNodeInfo {
         auto maximum = GetResourceMaximumValues();
         // basically, this is: return max(a / b);
         double usage = TTabletInfo::GetUsage(current, maximum);
+        usage = std::max(usage, GetNodeUsage() + (tablet.IsAliveOnNode(Id) ? 0 : tablet.Weight));
         return usage;
     }
 
     void UpdateResourceTotalUsage(double usage) {
+        if (NodeKind == OldCPU) {
+            usage *= 1.2;
+        }
+        usage *= g_usage_scrollbar->GetValue() / 100.0;
         AveragedNodeTotalUsage.Push(usage);
+        if (g_guess_usage_checkbox->IsChecked() && Tablets.size() == 1) {
+            (*Tablets.begin())->Weight = usage;
+        }
     }
 
     void AddTablet(TTabletInfo& tablet) {
@@ -363,7 +390,18 @@ struct TNodeInfo {
     TNodeInfo(TNodeId id) : Id(id) {}
 };
 
+
+enum EBalancerType {
+    Emergency,
+    ScatterCPU,
+    ScatterMemory,
+    ScatterNetwork,
+    ScatterCounter,
+    Scatter,
+};
+
 struct TBalancerSettings {
+    EBalancerType Type;
     int MaxMovements = 0;
     const std::vector<TNodeId> FilterNodeIds = {};
     EResourceToBalance ResourceToBalance = EResourceToBalance::ComputeResources;
@@ -436,6 +474,8 @@ struct THive {
 
     std::map<TNodeId, TNodeInfo> Nodes;
     std::map<TFullTabletId, TTabletInfo> Tablets;
+    EBalancerType LastTrigger;
+    Ui64 LastMovements;
 
     TNodeInfo* FindNode(TNodeId nodeId) {
         auto it = Nodes.find(nodeId);
@@ -483,14 +523,8 @@ struct THive {
         auto minValuesToBalance = GetMinNodeUsageToBalance();
         maxValues = piecewise_max(maxValues, minValuesToBalance);
         minValues = piecewise_max(minValues, minValuesToBalance);
-        *Log() << "GetStats: ";
-        Out(*Log(), minValues);
-        *Log() << " vs ";
-        Out(*Log(), maxValues);
-        *Log() << std::endl;
         auto discrepancy = maxValues - minValues;
         auto& counterDiscrepancy = std::get<EResource::Counter>(discrepancy);
-        *Log() << counterDiscrepancy * GetMaxResourceCounter() << std::endl;
         if (counterDiscrepancy * GetMaxResourceCounter() <= 1.5) {
             // We should ignore counter discrepancy of one - it cannot be fixed by balancer
             // Value 1.5 is used to avoid rounding errors
@@ -541,6 +575,27 @@ struct THive {
         *Log() << std::endl;
 
         double minUsageToKick = GetMaxNodeUsageToKick() - GetNodeUsageRangeToKick();
+        auto scatteredResource = CheckScatter(stats.ScatterByResource);
+        EBalancerType balancerType = EBalancerType::Emergency;
+        if (scatteredResource) {
+            switch (*scatteredResource) {
+                case EResourceToBalance::Counter:
+                    balancerType = EBalancerType::ScatterCounter;
+                    break;
+                case EResourceToBalance::CPU:
+                    balancerType = EBalancerType::ScatterCPU;
+                    break;
+                case EResourceToBalance::Memory:
+                    balancerType = EBalancerType::ScatterMemory;
+                    break;
+                case EResourceToBalance::Network:
+                    balancerType = EBalancerType::ScatterNetwork;
+                    break;
+                case EResourceToBalance::ComputeResources:
+                    balancerType = EBalancerType::Scatter;
+                    break;
+            }
+        }
         if (stats.MaxUsage >= GetMaxNodeUsageToKick() && stats.MinUsage < minUsageToKick) {
             std::vector<TNodeId> overloadedNodes;
             for (const auto& [nodeId, nodeInfo] : Nodes) {
@@ -550,17 +605,20 @@ struct THive {
             }
 
             if (!overloadedNodes.empty()) {
-                StartHiveBalancer({
-                    .MaxMovements = (int)GetMaxMovementsOnEmergencyBalancer(),
-                    .FilterNodeIds = std::move(overloadedNodes),
-                });
-                return;
+                if (!g_no_moves_checkbox->IsChecked() || LastTrigger == balancerType || LastMovements != 0) {
+                    StartHiveBalancer({
+                        .Type = EBalancerType::Emergency,
+                        .MaxMovements = (int)GetMaxMovementsOnEmergencyBalancer(),
+                        .FilterNodeIds = std::move(overloadedNodes),
+                    });
+                    return;
+                }
             }
         }
 
-        auto scatteredResource = CheckScatter(stats.ScatterByResource);
         if (scatteredResource) {
             StartHiveBalancer({
+                .Type = balancerType,
                 .MaxMovements = (int)GetMaxMovementsOnAutoBalancer(),
                 .ResourceToBalance = *scatteredResource,
             });
@@ -613,6 +671,7 @@ struct THive {
             double usage = nodeInfo.GetNodeUsageForTablet(tablet);
             selectedNodes.emplace_back(usage, &nodeInfo);
         }
+        *Log() << std::endl;
 
         TNodeInfo* selectedNode = nullptr;
         if (!selectedNodes.empty()) {
@@ -626,6 +685,9 @@ struct THive {
     }
     
     bool IsTabletMoveExpedient(const TTabletInfo& tablet, const TNodeInfo& node) const {
+        if (g_guess_usage_checkbox->IsChecked() && Nodes.at(tablet.NodeId).GetNodeUsageForTablet(tablet) <= node.GetNodeUsageForTablet(tablet)) {
+            return false;
+        }
         if (Nodes.at(tablet.NodeId).IsOverloaded() && !node.IsOverloaded()) {
             return true;
         }
@@ -674,14 +736,66 @@ struct THive {
         g_last_node_moved = from;
         TNodeInfo* fromNode = FindNode(from);
         TNodeInfo* toNode = FindNode(to);
-        fromNode->RemoveTablet(tablet);
+        if (fromNode) {
+            fromNode->RemoveTablet(tablet);
+        }
         toNode->AddTablet(tablet);
+    }
+
+    void FillNode(TNodeId nodeId) {
+        for (auto& [tabletId, tablet] : Tablets) {
+            auto result = FindBestNode(tablet);
+            if (std::holds_alternative<TNodeInfo*>(result)) {
+                TNodeInfo* node = std::get<TNodeInfo*>(result);
+                if (node->Id == nodeId) {
+                    MoveTablet(tablet, tablet.NodeId, nodeId);
+                }
+            }
+        }
+    }
+
+    void KillNode(TNodeId nodeId) {
+        auto it = Nodes.find(nodeId);
+        if (it == Nodes.end()) {
+            return;
+        }
+        auto& node = it->second;
+        node.Alive = false;
+        auto tablets = node.Tablets;
+        for (auto* tablet : tablets) {
+            auto result = FindBestNode(*tablet);
+            if (std::holds_alternative<TNodeInfo*>(result)) {
+                TNodeInfo* node = std::get<TNodeInfo*>(result);
+                MoveTablet(*tablet, nodeId, node->Id);
+            }
+        }
+        node.Drawn = false;
+    }
+
+    void RessurectNode(TNodeId nodeId) {
+        auto it = Nodes.find(nodeId);
+        if (it == Nodes.end()) {
+            return;
+        }
+        it->second.Alive = true;
+        it->second.Drawn = false;
     }
 
 };
 
 THive g_hive;
 std::unordered_set<TFullTabletId> g_burst_tablets;
+
+void ChangeTabletMetrics() {
+    g_max_tablet_metrics = g_tablet_metrics_scrollbar->GetValue();
+    const auto max_cpu = g_max_tablet_metrics;
+    std::uniform_int_distribution<Ui64> get_cpu(0, max_cpu);
+    for (auto& [tabletId, tablet] : g_hive.Tablets) {
+        if (tablet.Type != ETabletType::ColumnShard) {
+            tablet.UpdateResourceUsage({max_cpu, std::nullopt, std::nullopt});
+        }
+    }
+}
 
 struct THiveBalancer {
     THive* Hive = &g_hive;
@@ -791,6 +905,8 @@ struct THiveBalancer {
     void Run() {
         BalanceNodes();
         KickNextTablet();
+        g_hive.LastTrigger = Settings.Type;
+        g_hive.LastMovements = Movements;
     }
 };
 
@@ -809,18 +925,90 @@ void UpdateResourceValues(TNodeId nodeId, const TResourceRawValues& delta) {
     node->RawValues += delta;
 }
 
-struct BurstScenario {
-    void CreateInitialState() {
+TTabletInfo& MakeDS() {
+    const auto max_cpu = g_max_tablet_metrics;
+    std::uniform_int_distribution<Ui64> get_cpu(0, max_cpu);
+    const Ui64 max_memory = (double)g_max_tablet_metrics * std::get<EResource::Memory>(MAXIMUM_VALUES) / std::get<EResource::CPU>(MAXIMUM_VALUES);
+    std::uniform_int_distribution<Ui64> get_memory(0, max_memory);
+    TFullTabletId id = g_hive.Tablets.size() + 1;
+    g_hive.Tablets.emplace(id, TTabletInfo(id, {get_cpu(g_random), get_memory(g_random), 0, 0}, ETabletType::DataShard));
+    return g_hive.Tablets.at(id);
+}
+
+TTabletInfo& MakeCS() {
+    TFullTabletId id = g_hive.Tablets.size() + 1;
+    g_hive.Tablets.emplace(id, TTabletInfo(id, {0, 0, 0, 1}, ETabletType::ColumnShard));
+    return g_hive.Tablets.at(id);
+}
+
+TTabletInfo& MakeC() {
+    const auto max_cpu = g_max_tablet_metrics;
+    std::uniform_int_distribution<Ui64> get_cpu(0, max_cpu);
+    const Ui64 max_memory = (double)g_max_tablet_metrics * std::get<EResource::Memory>(MAXIMUM_VALUES) / std::get<EResource::CPU>(MAXIMUM_VALUES);
+    std::uniform_int_distribution<Ui64> get_memory(0, max_memory);
+    TFullTabletId id = g_hive.Tablets.size() + 1;
+    g_hive.Tablets.emplace(id, TTabletInfo(id, {get_cpu(g_random), get_memory(g_random), 0, 0}, ETabletType::Coordinator));
+    return g_hive.Tablets.at(id);
+}
+
+void CreateDS() {
+    TTabletInfo& tablet = MakeDS();
+    auto result = g_hive.FindBestNode(tablet);
+    if (std::holds_alternative<TNodeInfo*>(result)) {
+        g_hive.MoveTablet(tablet, 0, std::get<TNodeInfo*>(result)->Id);
+    }
+}
+
+void CreateCS() {
+    TTabletInfo& tablet = MakeCS();
+    auto result = g_hive.FindBestNode(tablet);
+    if (std::holds_alternative<TNodeInfo*>(result)) {
+        g_hive.MoveTablet(tablet, 0, std::get<TNodeInfo*>(result)->Id);
+    }
+}
+
+void CreateC() {
+    TTabletInfo& tablet = MakeC();
+    auto result = g_hive.FindBestNode(tablet);
+    if (std::holds_alternative<TNodeInfo*>(result)) {
+        g_hive.MoveTablet(tablet, 0, std::get<TNodeInfo*>(result)->Id);
+    }
+}
+
+struct IScenario {
+    virtual void CreateInitialState() {
+    }
+
+    virtual void UpdateModel() {
+        g_t += g_dt;
+        g_hive.ProcessTabletBalancer(); 
+
+        std::uniform_real_distribution<double> coordinator_usage(0.8, 1);
+        //std::uniform_real_distribution<double> normal_usage(0.3, 0.7);
+        for (auto& [nodeId, node] : g_hive.Nodes) {
+            unsigned coordinators = 0;
+            for (const auto* tablet : node.Tablets) {
+                coordinators += (tablet->Type == ETabletType::Coordinator);
+            } 
+            if (coordinators) {
+                node.UpdateResourceTotalUsage(coordinator_usage(g_random) * coordinators);
+            } else {
+                node.UpdateResourceTotalUsage(0);
+            }
+        }
+    }
+};
+
+struct BurstScenario : IScenario {
+    void CreateInitialState() override {
         const size_t num_nodes = 8;
         const size_t num_tablets = 42;
         for (TNodeId i = 1; i <= num_nodes; ++i) {
             g_hive.Nodes.emplace(i, TNodeInfo(i));
         }
 
-        const auto max_cpu = std::get<EResource::CPU>(MAXIMUM_VALUES) * num_nodes * 6 / num_tablets / 5;
-        std::uniform_int_distribution<Ui64> get_cpu(0, max_cpu);
         for (TFullTabletId i = 1; i <= num_tablets; ++i) {
-            g_hive.Tablets.emplace(i, TTabletInfo(i, {get_cpu(g_random), 0, 0, 0}));
+            MakeDS();
         }
 
         std::uniform_int_distribution<TNodeId> pick_node(1, num_nodes);
@@ -829,9 +1017,8 @@ struct BurstScenario {
         }
     }
 
-    void UpdateModel() {
-        g_t += g_dt;
-        g_hive.ProcessTabletBalancer(); 
+    void UpdateModel() override {
+        IScenario::UpdateModel();
 
         const auto max_cpu = std::get<EResource::CPU>(MAXIMUM_VALUES) * g_hive.Nodes.size() * 6 / g_hive.Tablets.size() / 5;
         std::poisson_distribution is_burst(g_dt / g_hive.Tablets.size());
@@ -850,23 +1037,19 @@ struct BurstScenario {
     }
 };
 
-struct HtapScenario {
-    void CreateInitialState() {
+struct HtapScenario : IScenario {
+    void CreateInitialState() override {
         const size_t num_nodes = 8;
         const size_t num_tablets = 42;
         for (TNodeId i = 1; i <= num_nodes; ++i) {
-            g_hive.Nodes.emplace(i, TNodeInfo(i));
+            TNodeInfo node(i);
+            g_hive.Nodes.emplace(i, node);
         }
-
-        const auto max_cpu = std::get<EResource::CPU>(MAXIMUM_VALUES) * num_nodes * 4 / num_tablets;
-        std::uniform_int_distribution<Ui64> get_cpu(0, max_cpu);
-        const auto max_memory = std::get<EResource::Memory>(MAXIMUM_VALUES) * num_nodes * 12 / num_tablets / 5;
-        std::uniform_int_distribution<Ui64> get_memory(0, max_memory);
         for (TFullTabletId i = 1; i <= num_tablets; ++i) {
             if (i % 2 == 0) {
-                g_hive.Tablets.emplace(i, TTabletInfo(i, {get_cpu(g_random), get_memory(g_random), 0, 0}, ETabletType::DataShard));
+                MakeDS();
             } else {
-                g_hive.Tablets.emplace(i, TTabletInfo(i, {0, 0, 0, 1}, ETabletType::ColumnShard));
+                MakeCS();
             }
         }
 
@@ -876,11 +1059,10 @@ struct HtapScenario {
         }
     }
 
-    void UpdateModel() {
-        g_t += g_dt;
-        g_hive.ProcessTabletBalancer(); 
+    void UpdateModel() override {
+        IScenario::UpdateModel();
 
-        const auto max_cpu = std::get<EResource::CPU>(MAXIMUM_VALUES) * g_hive.Nodes.size() * 12 / g_hive.Tablets.size() / 5;
+        const auto max_cpu = g_max_tablet_metrics;
         std::poisson_distribution is_burst(g_dt / g_hive.Tablets.size());
         for (auto& [tabletId, tablet] : g_hive.Tablets) {
             if (tablet.Type == ETabletType::DataShard && is_burst(g_random)) {
@@ -896,31 +1078,45 @@ struct HtapScenario {
         }
 
         for (auto& [nodeId, node] : g_hive.Nodes) {
-            double weight = 0;
-            for (const auto* tablet : node.Tablets) {
-                weight += tablet->GetWeight();
-            }
-            node.UpdateResourceTotalUsage(weight * 1.1);
+            node.UpdateResourceTotalUsage(node.Tablets.size() / 6.0);
         }
     }
 };
 
-struct OneFatTabletScenario {
-    void CreateInitialState() {
+struct OneFatTabletScenario : IScenario {
+    void CreateInitialState() override {
         const size_t num_nodes = 8;
         const size_t num_tablets = 42;
         for (TNodeId i = 1; i <= num_nodes; ++i) {
             g_hive.Nodes.emplace(i, TNodeInfo(i));
         }
 
-        const auto max_cpu = std::get<EResource::CPU>(MAXIMUM_VALUES) * num_nodes / num_tablets;
-        std::uniform_int_distribution<Ui64> get_cpu(0, max_cpu);
-        const auto max_memory = std::get<EResource::Memory>(MAXIMUM_VALUES) * num_nodes / num_tablets;
-        std::uniform_int_distribution<Ui64> get_memory(0, max_memory);
         for (TFullTabletId i = 1; i < num_tablets; ++i) {
-            g_hive.Tablets.emplace(i, TTabletInfo(i, {get_cpu(g_random), get_memory(g_random), 0, 0}, ETabletType::DataShard));
+            MakeDS();
         }
-        g_hive.Tablets.emplace(42, TTabletInfo(42, {get_cpu(g_random), get_memory(g_random), 0, 0}, ETabletType::Coordinator));
+        MakeC();
+
+        std::uniform_int_distribution<TNodeId> pick_node(1, num_nodes);
+        for (auto& [tabletId, tablet] : g_hive.Tablets) {
+            g_hive.FindNode(pick_node(g_random))->AddTablet(tablet);
+        }
+    }
+
+    void UpdateModel() override {
+        IScenario::UpdateModel();
+    }
+};
+
+struct SmallScenario : IScenario {
+    void CreateInitialState() override {
+        const size_t num_nodes = 3;
+        const size_t num_tablets = 25;
+        for (TNodeId i = 1; i <= num_nodes; ++i) {
+            g_hive.Nodes.emplace(i, TNodeInfo(i));
+        }
+        for (TFullTabletId i = 1; i <= num_tablets; ++i) {
+            MakeDS();
+        }
 
         std::uniform_int_distribution<TNodeId> pick_node(1, num_nodes);
         for (auto& [tabletId, tablet] : g_hive.Tablets) {
@@ -929,35 +1125,64 @@ struct OneFatTabletScenario {
     }
 
     void UpdateModel() {
-        g_t += g_dt;
-        g_hive.ProcessTabletBalancer(); 
+        IScenario::UpdateModel(); 
+    }
+};
 
-        std::uniform_real_distribution<double> coordinator_usage(0.8, 1);
-        std::uniform_real_distribution<double> normal_usage(0.3, 0.7);
-        auto coordinator_node = g_hive.Tablets.at(42).NodeId;
+struct ColumnShardScenario : IScenario {
+    void CreateInitialState() {
+        const size_t num_nodes = 8;
+        const size_t num_tablets = 42;
+        for (TNodeId i = 1; i <= num_nodes; ++i) {
+            g_hive.Nodes.emplace(i, TNodeInfo(i));
+        }
+
+        for (TFullTabletId i = 1; i <= num_tablets; ++i) {
+            g_hive.Tablets.emplace(i, TTabletInfo(i, {0, 0, 0, 1}, ETabletType::ColumnShard));
+        }
+
+        std::uniform_int_distribution<TNodeId> pick_node(1, num_nodes);
+        for (auto& [tabletId, tablet] : g_hive.Tablets) {
+            g_hive.FindNode(pick_node(g_random))->AddTablet(tablet);
+        }
+    }
+
+    void UpdateModel() {
+        IScenario::UpdateModel();
+
         for (auto& [nodeId, node] : g_hive.Nodes) {
-            if (nodeId == coordinator_node) {
-                node.UpdateResourceTotalUsage(coordinator_usage(g_random));
-            } else {
-                node.UpdateResourceTotalUsage(normal_usage(g_random));
-            }
+            node.UpdateResourceTotalUsage(node.Tablets.size() / 10.0);
         }
     }
 };
 
-void DrawModel() {
-    char text[128];
+void AddNode() {
+    TNodeId id = g_hive.Nodes.size() + 1;
+    g_hive.Nodes.emplace(id, TNodeInfo(id));
+    if (g_fill_nodes_checkbox->IsChecked()) {
+        g_hive.FillNode(id);
+    }
+}
 
+void DrawModel() {
     Si32 x = 50;
     for (const auto& [nodeId, node] : g_hive.Nodes) {
-        DrawRectangle(Vec2Si32{x, 400}, Vec2Si32{x + 150, 550}, Rgba{32, 255, 64});
+        Rgba color;
+        if (!node.IsAlive()) {
+            color = Rgba{180, 0, 64}; 
+        } else if (node.NodeKind) {
+            color = Rgba{32, 255, 64};
+        } else {
+            color = Rgba{0, 255, 100};
+        }
+        DrawRectangle(Vec2Si32{x, 400}, Vec2Si32{x + 150, 550}, color);
         Si32 x_tablet = x + 10;
         Si32 y_tablet = 540;
         for (const auto* tablet: node.Tablets) {
             Rgba color = tablet->GetColor();
             if (tablet->Id == g_last_tablet_moved) {
                 DrawCircle(Vec2Si32{x_tablet, y_tablet}, 10, Rgba(255, 0, 0));
-                DrawCircle(Vec2Si32{x_tablet, y_tablet}, 8, color);
+                DrawCircle(Vec2Si32{x_tablet, y_tablet}, 5, color);
             } else {
                 DrawCircle(Vec2Si32{x_tablet, y_tablet}, 10, color);
             }
@@ -973,6 +1198,40 @@ void DrawModel() {
             text << " (*)";
         }
         g_font.Draw(text.str().c_str(), x, 580, kTextOriginTop);
+
+        if (!node.Drawn) {
+            std::shared_ptr<Button> button;
+            button = gf.MakeButton();
+            if (node.NodeKind == TNodeInfo::ENodeKind::ModernCPU) {
+                button->SetText("Modern CPU");
+            } else {
+                button->SetText("Old CPU");
+            }
+            button->SetPos(Vec2Si32(x, 320));
+            button->SetWidth(175);
+            button->OnButtonClick = [id = nodeId]() {
+                auto& node = g_hive.Nodes.at(id);
+                node.NodeKind ^= 1;
+                node.Drawn = false;
+            };
+            g_gui->AddChild(button);
+            button = gf.MakeButton();
+            button->SetPos(Vec2Si32(x, 250));
+            button->SetWidth(175);
+            if (node.IsAlive()) {
+                button->SetText("Kill");
+                button->OnButtonClick = [id = nodeId]() {
+                    g_hive.KillNode(id);
+                };
+            } else {
+                button->SetText("Start");
+                button->OnButtonClick = [id = nodeId]() {
+                    g_hive.RessurectNode(id);
+                };
+            }
+            g_gui->AddChild(button);
+            node.Drawn = true;
+        }
         x += 200; 
     }
 }
@@ -988,7 +1247,6 @@ void EasyMain() {
   ResizeScreen(1920, 1080);
 
   // Create GUI elements
-  GuiFactory gf;
   gf.theme_ = g_theme;
   g_gui = gf.MakeTransparentPanel();
   std::shared_ptr<Button> button;
@@ -1007,10 +1265,88 @@ void EasyMain() {
   button->OnButtonClick = SpeedUp;
   g_gui->AddChild(button);
 
+  button = gf.MakeButton();
+  button->SetText("Add node");
+  button->SetPos(Vec2Si32(16+2*208, 935));
+  button->SetWidth(200);
+  button->OnButtonClick = AddNode;
+  g_gui->AddChild(button);
+
+  g_tablet_metrics_scrollbar = gf.MakeHorizontalScrollbar();
+  g_tablet_metrics_scrollbar->SetMinValue(0);
+  g_tablet_metrics_scrollbar->SetMaxValue(1'000'000'000);
+  g_tablet_metrics_scrollbar->SetPos(Vec2Si32(16+3*208, 935));
+  g_tablet_metrics_scrollbar->SetValue(g_max_tablet_metrics);
+  g_tablet_metrics_scrollbar->OnScrollChange = ChangeTabletMetrics;
+  g_gui->AddChild(g_tablet_metrics_scrollbar);
+
+  g_usage_scrollbar = gf.MakeHorizontalScrollbar();
+  g_usage_scrollbar->SetMinValue(0);
+  g_usage_scrollbar->SetMaxValue(200);
+  g_usage_scrollbar->SetPos(Vec2Si32(16+4*208, 935));
+  g_usage_scrollbar->SetValue(100);
+  g_gui->AddChild(g_usage_scrollbar);
+
+  button = gf.MakeButton();
+  button->SetText("Create DS");
+  button->SetPos(Vec2Si32(16+5*208, 935));
+  button->SetWidth(200);
+  button->OnButtonClick = CreateDS;
+  g_gui->AddChild(button);
+
+  button = gf.MakeButton();
+  button->SetText("Create CS");
+  button->SetPos(Vec2Si32(16+6*208, 935));
+  button->SetWidth(200);
+  button->OnButtonClick = CreateCS;
+  g_gui->AddChild(button);
+
+  button = gf.MakeButton();
+  button->SetText("Create C");
+  button->SetPos(Vec2Si32(16+7*208, 935));
+  button->SetWidth(200);
+  button->OnButtonClick = CreateC;
+  g_gui->AddChild(button);
+
+  g_no_moves_checkbox = gf.MakeCheckbox();
+  g_no_moves_checkbox->SetText("check no moves");
+  g_no_moves_checkbox->SetPos(Vec2Si32(16+8*208, 935));
+  g_gui->AddChild(g_no_moves_checkbox);
+
+  g_guess_usage_checkbox = gf.MakeCheckbox();
+  g_guess_usage_checkbox->SetText("guess usage");
+  g_guess_usage_checkbox->SetPos(Vec2Si32(16+8*208, 985));
+  g_gui->AddChild(g_guess_usage_checkbox);
+
+  g_fill_nodes_checkbox = gf.MakeCheckbox();
+  g_fill_nodes_checkbox->SetText("fill nodes");
+  g_fill_nodes_checkbox->SetPos(Vec2Si32(16+8*208, 885));
+  g_gui->AddChild(g_fill_nodes_checkbox);
+
 
   // Create initial simulation state
-  OneFatTabletScenario scenario; // Change the type here for different scenarios
-  scenario.CreateInitialState();
+  std::unique_ptr<IScenario> scenario;
+  auto txt = ReadFile("scenario.txt");
+  switch (txt[0]) {
+      default:
+      case '0':
+          scenario = std::make_unique<BurstScenario>();
+          break;
+      case '1':
+          scenario = std::make_unique<HtapScenario>();
+          break;
+      case '2':
+          scenario = std::make_unique<OneFatTabletScenario>();
+          break;
+      case '3':
+          scenario = std::make_unique<ColumnShardScenario>();
+          break;
+      case '4':
+          scenario = std::make_unique<SmallScenario>();
+          break;
+  }
+
+  scenario->CreateInitialState();
 
   // Main simulation loop
   double rt0 = Time();
@@ -1029,7 +1365,7 @@ void EasyMain() {
 
     // Update simulation state until target time is reached or timeout
     while (g_t < t_target && Time() - rt1 < 0.1) {
-      scenario.UpdateModel();
+      scenario->UpdateModel();
     }
 
     // Apply GUI input
@@ -1045,6 +1381,8 @@ void EasyMain() {
     char text[128];
     snprintf(text, sizeof(text), "Model time: %f s\nTarget multiplier: %f", g_t, g_t_mult);
     g_font.Draw(text, 20, ScreenSize().y - 20, kTextOriginTop);
+    g_font.Draw("tablet metrics", 16+3*208, 1000, kTextOriginTop);
+    g_font.Draw("total usage", 16+4*208, 1000, kTextOriginTop);
 
     // Show frame
     ShowFrame();
