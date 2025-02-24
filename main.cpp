@@ -33,6 +33,8 @@ std::shared_ptr<Scrollbar> g_usage_scrollbar;
 std::shared_ptr<Checkbox> g_no_moves_checkbox;
 std::shared_ptr<Checkbox> g_guess_usage_checkbox;
 std::shared_ptr<Checkbox> g_fill_nodes_checkbox;
+std::shared_ptr<Checkbox> g_stick_checkbox;
+std::shared_ptr<Checkbox> g_priority_checkbox;
 Si32 g_max_tablet_metrics = 100'000'000; 
 
 
@@ -55,6 +57,8 @@ using TNodeId = Ui32;
 using TResourceRawValues = std::tuple<Si64, Si64, Si64, Si64>;
 using TResourceNormalizedValues = std::tuple<double, double, double, double>;
 using TFullTabletId = Ui32;
+using TDataCenterId = Ui32;
+using TTabletCategoryId = Ui32;
 
 const TResourceRawValues MAXIMUM_VALUES = {1'000'000'000, 64'000'000'000ull, 1'000'000'000, 1'000'000};
 
@@ -184,6 +188,22 @@ TNodeId g_last_node_moved;
 
 void UpdateResourceValues(TNodeId nodeId, const TResourceRawValues& delta);
 
+struct TTabletInfo;
+
+struct TTabletCategoryInfo {
+    TTabletCategoryId Id;
+    std::unordered_set<TFullTabletId> Tablets;
+    Ui64 MaxDisconnectTimeout = 0;
+    bool StickTogetherInDC = false;
+
+    TTabletCategoryInfo(TTabletCategoryId id, bool stickTogether)
+        : Id(id)
+        , StickTogetherInDC(stickTogether)
+    {}
+};
+
+TTabletCategoryInfo g_system_category(0, true);
+
 struct TTabletInfo {
     TResourceRawValues ResourceValues;
     TTabletMetricsAggregates ResourceMetricsAggregates;
@@ -192,6 +212,9 @@ struct TTabletInfo {
     TNodeId NodeId;
     TInstant LastBalancerDecisionTime = 0;
     double Weight = 0;
+    TTabletCategoryInfo* Category = nullptr; 
+    bool Alive = true;
+    TNodeId FailedNodeId = 0;
 
     bool IsGoodForBalancer(TInstant now) {
         return (now - LastBalancerDecisionTime > GetTabletKickCooldownPeriod()) || LastBalancerDecisionTime == 0;
@@ -290,11 +313,23 @@ struct TTabletInfo {
         }
     }
 
+    bool IsAlive() const {
+        return Alive && NodeId != 0;
+    }
+
+    double GetPriority() const {
+        return (Type == ETabletType::Coordinator) + GetWeight();
+    }
+
     TTabletInfo(TFullTabletId id, const TResourceRawValues& metrics, ETabletType type = ETabletType::Dummy)
         : Id(id)
         , ResourceValues(metrics)
         , Type(type)
     {
+        if (Type == ETabletType::Coordinator) {
+            Category = &g_system_category;
+            Category->Tablets.insert(Id);
+        }
     }
 
     Rgba GetColor() const {
@@ -318,6 +353,9 @@ struct TNodeInfo {
     Ui32 NodeKind = ModernCPU;
     mutable bool Drawn = false;
     bool Alive = true;
+    TDataCenterId DataCenterId;
+    TInstant StartTime = Now();
+    std::vector<TInstant> RestartTimestamps; 
 
     bool IsAlive() const {
         return Alive;
@@ -387,7 +425,29 @@ struct TNodeInfo {
         tablet.NodeId = 0;
     }
 
-    TNodeInfo(TNodeId id) : Id(id) {}
+    TDataCenterId GetDataCenter() const {
+        return DataCenterId;
+    }
+
+    Si32 GetPriorityForTablet(const TTabletInfo& tablet, std::unordered_map<TDataCenterId, Si32>& dcPriority) const {
+        Si32 priority = 0;
+
+        if (tablet.FailedNodeId == Id) {
+            --priority;
+        }
+        
+        priority += dcPriority[GetDataCenter()];
+        if (g_priority_checkbox->IsChecked()) {
+            priority -= GetRestarts() / 3;
+        }
+        return priority;
+    }
+
+    Ui64 GetRestarts() const {
+        return RestartTimestamps.size();
+    }
+
+    TNodeInfo(TNodeId id, TDataCenterId dc = 0) : Id(id), DataCenterId(dc) {}
 };
 
 
@@ -570,7 +630,7 @@ struct THive {
             return;
         }
         THiveStats stats = GetStats();
-        *Log() << g_t << " ProcessTabletBalancer: max usage = " << stats.MaxUsage << ", min usage = " << stats.MinUsage << ", scatter = ";
+        // *Log() << g_t << " ProcessTabletBalancer: max usage = " << stats.MaxUsage << ", min usage = " << stats.MinUsage << ", scatter = ";
         Out(*Log(),  stats.ScatterByResource);
         *Log() << std::endl;
 
@@ -654,27 +714,90 @@ struct THive {
         return selectedNodes[rnd(g_random)].Node;
     }
 
+    std::vector<THive::TSelectedNode> SelectMaxPriorityNodes(std::vector<TSelectedNode> selectedNodes, const TTabletInfo& tablet, std::unordered_map<TDataCenterId, Si32>& dcPriority) const
+    {
+        Si32 priority = std::numeric_limits<Si32>::min();
+        for (const TSelectedNode& selectedNode : selectedNodes) {
+            priority = std::max(priority, selectedNode.Node->GetPriorityForTablet(tablet, dcPriority));
+        }
+
+        auto it = std::partition(selectedNodes.begin(), selectedNodes.end(), [&] (const TSelectedNode& selectedNode) {
+            return selectedNode.Node->GetPriorityForTablet(tablet, dcPriority) == priority;
+        });
+
+        selectedNodes.erase(it, selectedNodes.end());
+
+        return selectedNodes;
+    }
+
     TBestNodeResult FindBestNode(const TTabletInfo& tablet) {
-        std::vector<TNodeInfo*> candidateNodes;
+        std::vector<TDataCenterId> dcs;
+        if (tablet.Category && tablet.Category->StickTogetherInDC && g_stick_checkbox->IsChecked()) {
+            std::unordered_map<TDataCenterId, Ui32> dcTablets;
+            for (TFullTabletId tabletId : tablet.Category->Tablets) {
+                TTabletInfo* tab = FindTablet(tabletId);
+                if (tab->IsAlive()) {
+                    TDataCenterId dc = FindNode(tab->NodeId)->GetDataCenter();
+                    dcTablets[dc]++;
+                    *Log() << "Increment for dc " << dc << std::endl;
+                }
+            }
+            if (!dcTablets.empty()) {
+                for (const auto& [dc, count] : dcTablets) {
+                    dcs.push_back(dc);
+                }
+                std::sort(dcs.begin(), dcs.end(), [&](TDataCenterId a, TDataCenterId b) -> bool {
+                    return dcTablets[a] > dcTablets[b];
+                });
+            }
+        }
+
+        std::vector<std::vector<TNodeInfo*>> candidateGroups;
+        candidateGroups.resize(dcs.size() + 1);
+        std::unordered_map<TDataCenterId, std::vector<TNodeInfo*>*> indexDC2Group;
+        std::unordered_map<TDataCenterId, Si32> dcPriority;
+        for (size_t numGroup = 0; numGroup < dcs.size(); ++numGroup) {
+            indexDC2Group[dcs[numGroup]] = candidateGroups.data() + numGroup;
+            if (g_priority_checkbox->IsChecked()) {
+                dcPriority[dcs[numGroup]] = dcs.size() - numGroup;
+            }
+        }
         for (auto it = Nodes.begin(); it != Nodes.end(); ++it) {
             TNodeInfo* nodeInfo = &it->second;
             if (nodeInfo->IsAlive()) {
-                candidateNodes.push_back(nodeInfo);
+                TDataCenterId dataCenterId = nodeInfo->GetDataCenter();
+                auto itDataCenter = indexDC2Group.find(dataCenterId);
+                if (!g_priority_checkbox->IsChecked() && itDataCenter != indexDC2Group.end()) {
+                    itDataCenter->second->push_back(nodeInfo);
+                    *Log() << "Node " << nodeInfo->Id << " in dc " << dataCenterId << " in group " << (Ui64)itDataCenter->second << std::endl;
+                } else {
+                    candidateGroups.back().push_back(nodeInfo);
+                    *Log() << "Node " << nodeInfo->Id << " in dc " << dataCenterId << " in group [default]" << std::endl; 
+                }
             }
         }
 
         std::vector<TSelectedNode> selectedNodes;
-        selectedNodes.reserve(candidateNodes.size());
 
-        for (auto it = candidateNodes.begin(); it != candidateNodes.end(); ++it) {
-            TNodeInfo& nodeInfo = *(*it);
-            double usage = nodeInfo.GetNodeUsageForTablet(tablet);
-            selectedNodes.emplace_back(usage, &nodeInfo);
+        for (auto itCandidateNodes = candidateGroups.begin(); itCandidateNodes != candidateGroups.end(); ++itCandidateNodes) {
+            const std::vector<TNodeInfo*>& candidateNodes(*itCandidateNodes);
+
+            selectedNodes.reserve(candidateNodes.size());
+
+            for (auto it = candidateNodes.begin(); it != candidateNodes.end(); ++it) {
+                TNodeInfo& nodeInfo = *(*it);
+                double usage = nodeInfo.GetNodeUsageForTablet(tablet);
+                selectedNodes.emplace_back(usage, &nodeInfo);
+            }
+
+            if (!selectedNodes.empty()) {
+                break;
+            }
         }
-        *Log() << std::endl;
 
         TNodeInfo* selectedNode = nullptr;
         if (!selectedNodes.empty()) {
+            selectedNodes = SelectMaxPriorityNodes(std::move(selectedNodes), tablet, dcPriority);
             selectedNode = SelectNode(selectedNodes);
         }
         if (selectedNode != nullptr) {
@@ -740,6 +863,7 @@ struct THive {
             fromNode->RemoveTablet(tablet);
         }
         toNode->AddTablet(tablet);
+        tablet.Alive = true;
     }
 
     void FillNode(TNodeId nodeId) {
@@ -761,7 +885,14 @@ struct THive {
         }
         auto& node = it->second;
         node.Alive = false;
-        auto tablets = node.Tablets;
+        std::vector<TTabletInfo*> tablets(node.Tablets.begin(), node.Tablets.end());
+        for (auto* tablet : tablets) {
+            tablet->Alive = false;
+            tablet->FailedNodeId = nodeId;
+        }
+        std::sort(tablets.begin(), tablets.end(), [](const auto& lhs, const auto& rhs) {
+            return lhs->GetPriority() < rhs->GetPriority();     
+        });
         for (auto* tablet : tablets) {
             auto result = FindBestNode(*tablet);
             if (std::holds_alternative<TNodeInfo*>(result)) {
@@ -779,6 +910,8 @@ struct THive {
         }
         it->second.Alive = true;
         it->second.Drawn = false;
+        it->second.StartTime = Now();
+        it->second.RestartTimestamps.push_back(Now());
     }
 
 };
@@ -1156,6 +1289,39 @@ struct ColumnShardScenario : IScenario {
     }
 };
 
+struct BadDcScenario : IScenario {
+    void CreateInitialState() override {
+        const size_t num_nodes = 9;
+        const size_t num_tablets = 70;
+        g_usage_scrollbar->SetValue(0);
+        g_tablet_metrics_scrollbar->SetValue(0.025 * std::get<EResource::CPU>(MAXIMUM_VALUES));
+        for (TNodeId i = 1; i <= num_nodes; ++i) {
+            g_hive.Nodes.emplace(i, TNodeInfo(i, (i - 1) / 3 + 1));
+        }
+
+        auto& firstC = MakeC(); // to put it in the first dc
+        g_hive.FindNode(0)->AddTablet(firstC);
+        for (int i = 0; i < num_tablets; ++i) {
+            if (i % 14 == 0) {
+                CreateC();
+            } else {
+                CreateDS();
+            }
+        }
+    }
+
+    void UpdateModel() override {
+        IScenario::UpdateModel();
+        std::uniform_int_distribution<TNodeId> pickNode(1, 3);
+        std::poisson_distribution verify(5 * g_dt);
+        if (verify(g_random)) {
+            TNodeId nodeId = pickNode(g_random);
+            g_hive.KillNode(nodeId);
+            g_hive.RessurectNode(nodeId);
+        }
+    }
+};
+
 void AddNode() {
     TNodeId id = g_hive.Nodes.size() + 1;
     g_hive.Nodes.emplace(id, TNodeInfo(id));
@@ -1175,7 +1341,9 @@ void DrawModel() {
         } else {
             color = Rgba{0, 255, 100};
         }
-        DrawRectangle(Vec2Si32{x, 400}, Vec2Si32{x + 150, 550}, color);
+        const std::vector<Rgba> dcColors = {color, Rgba(200, 0, 200), Rgba(0, 180, 120), Rgba(255, 128, 0)};
+        DrawRectangle(Vec2Si32{x, 400}, Vec2Si32{x + 150, 550}, dcColors[node.GetDataCenter()]);
+        DrawRectangle(Vec2Si32{x + 10, 400 + 10}, Vec2Si32{x + 150 - 10, 550 - 10}, color);
         Si32 x_tablet = x + 10;
         Si32 y_tablet = 540;
         for (const auto* tablet: node.Tablets) {
@@ -1194,6 +1362,7 @@ void DrawModel() {
         }
         std::stringstream text;
         text << static_cast<int>(node.GetNodeUsage() * 100) << "%";
+        text << " " << Now() - node.StartTime;
         if (g_last_node_moved == node.Id) {
             text << " (*)";
         }
@@ -1323,6 +1492,19 @@ void EasyMain() {
   g_fill_nodes_checkbox->SetPos(Vec2Si32(16+8*208, 885));
   g_gui->AddChild(g_fill_nodes_checkbox);
 
+  g_stick_checkbox = gf.MakeCheckbox();
+  g_stick_checkbox->SetText("stick together");
+  g_stick_checkbox->SetPos(Vec2Si32(16+8*208, 835));
+  g_stick_checkbox->SetChecked(true);
+  g_gui->AddChild(g_stick_checkbox);
+
+  g_priority_checkbox = gf.MakeCheckbox();
+  g_priority_checkbox->SetText("updated priority");
+  g_priority_checkbox->SetPos(Vec2Si32(16+8*208, 785));
+  g_priority_checkbox->SetChecked(false);
+  g_gui->AddChild(g_priority_checkbox);
+
+
 
   // Create initial simulation state
   std::unique_ptr<IScenario> scenario;
@@ -1343,6 +1525,9 @@ void EasyMain() {
           break;
       case '4':
           scenario = std::make_unique<SmallScenario>();
+          break;
+      case '5':
+          scenario = std::make_unique<BadDcScenario>();
           break;
   }
 
